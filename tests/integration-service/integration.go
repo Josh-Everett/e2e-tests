@@ -230,6 +230,105 @@ var _ = framework.IntegrationServiceSuiteDescribe("Integration Service E2E tests
 		})
 	})
 
+	ginkgo.Describe("with an integration test warning", ginkgo.Ordered, func() {
+		ginkgo.BeforeAll(func() {
+			// Initialize the tests controllers
+			f, err = framework.NewFramework(utils.GetGeneratedNamespace("integration3"))
+			gomega.Expect(err).NotTo(gomega.HaveOccurred())
+			testNamespace = f.UserNamespace
+
+			applicationName = createApp(*f, testNamespace)
+			originalComponent, componentName, pacBranchName, componentBaseBranchName = createComponent(*f, testNamespace, applicationName, componentRepoNameForGeneralIntegration, componentGitSourceURLForGeneralIntegration)
+
+			integrationTestScenario, err = f.AsKubeAdmin.IntegrationController.CreateIntegrationTestScenario("", applicationName, testNamespace, gitURL, revision, pathInRepoWarning, "", []string{"pull_request"})
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+		})
+
+		ginkgo.AfterAll(func() {
+			if !ginkgo.CurrentSpecReport().Failed() {
+				cleanup(*f, testNamespace, applicationName, componentName, snapshot)
+			}
+
+			// Delete new branches created by PaC and a testing branch used as a component's base branch
+			err = f.AsKubeAdmin.CommonController.Github.DeleteRef(componentRepoNameForGeneralIntegration, pacBranchName)
+			if err != nil {
+				gomega.Expect(err.Error()).To(gomega.ContainSubstring(referenceDoesntExist))
+			}
+			err = f.AsKubeAdmin.CommonController.Github.DeleteRef(componentRepoNameForGeneralIntegration, componentBaseBranchName)
+			if err != nil {
+				gomega.Expect(err.Error()).To(gomega.ContainSubstring(referenceDoesntExist))
+			}
+		})
+
+		ginkgo.It("triggers a build PipelineRun", ginkgo.Label("integration-service"), func() {
+			pipelineRun, err = f.AsKubeDeveloper.IntegrationController.GetBuildPipelineRun(componentName, applicationName, testNamespace, false, "")
+			gomega.Expect(pipelineRun.Annotations[snapshotAnnotation]).To(gomega.Equal(""))
+			gomega.Expect(f.AsKubeDeveloper.HasController.WaitForComponentPipelineToBeFinished(originalComponent, "", "", "", f.AsKubeAdmin.TektonController,
+				&has.RetryOptions{Retries: 2, Always: true}, pipelineRun)).To(gomega.Succeed())
+		})
+
+		ginkgo.It("should have a related PaC init PR created", func() {
+			gomega.Eventually(func() bool {
+				prs, err := f.AsKubeAdmin.CommonController.Github.ListPullRequests(componentRepoNameForGeneralIntegration)
+				gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+				for _, pr := range prs {
+					if pr.Head.GetRef() == pacBranchName {
+						prHeadSha = pr.Head.GetSHA()
+						return true
+					}
+				}
+				return false
+			}, shortTimeout, constants.PipelineRunPollingInterval).Should(gomega.BeTrue(), fmt.Sprintf("timed out when waiting for init PaC PR (branch name '%s') to be created in %s repository", pacBranchName, componentRepoNameForGeneralIntegration))
+
+			// in case the first pipelineRun attempt has failed and was retried, we need to update the value of pipelineRun variable
+			pipelineRun, err = f.AsKubeAdmin.HasController.GetComponentPipelineRun(componentName, applicationName, testNamespace, prHeadSha)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("checks if the BuildPipelineRun have the annotation of chains signed", func() {
+			gomega.Expect(f.AsKubeDeveloper.IntegrationController.WaitForBuildPipelineRunToGetAnnotated(testNamespace, applicationName, componentName, chainsSignedAnnotation)).To(gomega.Succeed())
+		})
+
+		ginkgo.It("checks if the Snapshot is created", func() {
+			snapshot, err = f.AsKubeDeveloper.IntegrationController.WaitForSnapshotToGetCreated("", pipelineRun.Name, componentName, testNamespace)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+		})
+
+		ginkgo.It("checks if the Build PipelineRun got annotated with Snapshot name", func() {
+			gomega.Expect(f.AsKubeDeveloper.IntegrationController.WaitForBuildPipelineRunToGetAnnotated(testNamespace, applicationName, componentName, snapshotAnnotation)).To(gomega.Succeed())
+		})
+
+		ginkgo.It("checks if all of the integrationPipelineRuns finished", ginkgo.Label("slow"), func() {
+			gomega.Expect(f.AsKubeDeveloper.IntegrationController.WaitForAllIntegrationPipelinesToBeFinished(testNamespace, applicationName, snapshot, []string{integrationTestScenario.Name})).To(gomega.Succeed())
+		})
+
+		ginkgo.It("checks if the warning status of integration test is reported in the Snapshot", func() {
+			gomega.Eventually(func() error {
+				snapshot, err = f.AsKubeAdmin.IntegrationController.GetSnapshot(snapshot.Name, "", "", testNamespace)
+				gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+
+				statusDetail, err := f.AsKubeDeveloper.IntegrationController.GetIntegrationTestStatusDetailFromSnapshot(snapshot, integrationTestScenario.Name)
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+
+				if statusDetail.Status != intgteststat.IntegrationTestStatusTestWarning {
+					return fmt.Errorf("test status doesn't have expected value %s", intgteststat.IntegrationTestStatusTestWarning)
+				}
+				return nil
+			}, shortTimeout, constants.PipelineRunPollingInterval).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("checks if snapshot is marked as passed", ginkgo.FlakeAttempts(3), func() {
+			snapshot, err = f.AsKubeAdmin.IntegrationController.GetSnapshot(snapshot.Name, "", "", testNamespace)
+			gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
+			gomega.Expect(f.AsKubeAdmin.CommonController.HaveTestsSucceeded(snapshot)).To(gomega.BeTrue(), "expected tests to succeed for snapshot %s/%s with warning outcome", snapshot.GetNamespace(), snapshot.GetName())
+		})
+
+		ginkgo.It("checks if the finalizer was removed from all of the related Integration pipelineRuns", func() {
+			gomega.Expect(f.AsKubeDeveloper.IntegrationController.WaitForFinalizerToGetRemovedFromAllIntegrationPipelineRuns(testNamespace, applicationName, snapshot, []string{integrationTestScenario.Name})).To(gomega.Succeed())
+		})
+	})
+
 	ginkgo.Describe("with an integration test fail", ginkgo.Ordered, func() {
 		ginkgo.BeforeAll(func() {
 			// Initialize the tests controllers

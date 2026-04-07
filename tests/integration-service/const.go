@@ -16,6 +16,7 @@ const (
 	pathInRepoPassPipelinerun      = "pipelineruns/integration_resolver_pipelinerun_pass.yaml"
 	pathIntegrationPipelineWithEnv = "pipelines/integration_resolver_pipeline_environment_pass.yaml"
 	pathInRepoFail                 = "pipelines/integration_resolver_pipeline_fail.yaml"
+	pathInRepoWarning              = "pipelines/integration_resolver_pipeline_warning.yaml"
 	pathInRepoTask                 = "tasks/integration_resolver_task_pass.yaml"
 	autoReleasePlan                = "auto-releaseplan"
 	targetReleaseNamespace         = "default"
